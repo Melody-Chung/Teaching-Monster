@@ -4,13 +4,28 @@ import shutil
 import subprocess
 from pathlib import Path
 
+MIN_AUDIO_SAMPLE_RATE = 16_000
+MIN_VIDEO_HEIGHT = 720
+MAX_VIDEO_DURATION_SECONDS = 30 * 60
+MAX_VIDEO_SIZE_BYTES = 3 * 1024 * 1024 * 1024
+MAX_SUPPORTING_FILES_BYTES = 100 * 1024 * 1024
+MAX_SUPPLEMENTARY_FILES = 5
+
 
 def ensure_command_available(command_name: str):
     if shutil.which(command_name) is None:
         raise RuntimeError(f"The '{command_name}' command is not available in the current environment.")
 
 
-def generate_english_audio(script_text: str, output_audio_path: str):
+def file_size_bytes(file_path: str) -> int:
+    return Path(file_path).stat().st_size
+
+
+def total_size_bytes(paths: list[str]) -> int:
+    return sum(file_size_bytes(path) for path in paths if Path(path).exists())
+
+
+def generate_english_audio(script_text: str, output_audio_path: str, timeout_seconds: int = 600):
     ensure_command_available("edge-tts")
 
     temp_text_path = output_audio_path.replace(".mp3", ".txt")
@@ -29,7 +44,13 @@ def generate_english_audio(script_text: str, output_audio_path: str):
     ]
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+        )
         print(f"Audio generated at: {output_audio_path}")
     except subprocess.CalledProcessError as exc:
         error_msg = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else "Unknown error"
@@ -70,7 +91,7 @@ def probe_media(media_path: str) -> dict:
     }
 
 
-def extend_video_to_duration(video_path: str, target_duration_seconds: float) -> str:
+def extend_video_to_duration(video_path: str, target_duration_seconds: float, timeout_seconds: int = 600) -> str:
     ensure_command_available("ffmpeg")
 
     current_duration = probe_media(video_path)["duration_seconds"]
@@ -95,15 +116,15 @@ def extend_video_to_duration(video_path: str, target_duration_seconds: float) ->
         "-an",
         str(padded_path),
     ]
-    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_seconds)
     return str(padded_path)
 
 
-def merge_video_and_audio(video_path: str, audio_path: str, final_output_path: str):
+def merge_video_and_audio(video_path: str, audio_path: str, final_output_path: str, timeout_seconds: int = 600):
     ensure_command_available("ffmpeg")
 
     audio_duration = probe_media(audio_path)["duration_seconds"]
-    usable_video_path = extend_video_to_duration(video_path, audio_duration)
+    usable_video_path = extend_video_to_duration(video_path, audio_duration, timeout_seconds=timeout_seconds)
 
     print("Merging video and audio with FFmpeg...")
     command = [
@@ -118,13 +139,19 @@ def merge_video_and_audio(video_path: str, audio_path: str, final_output_path: s
         "-c:a",
         "aac",
         "-ar",
-        "16000",
+        str(MIN_AUDIO_SAMPLE_RATE),
         "-shortest",
         final_output_path,
     ]
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+        )
         print(f"Final merged video saved at: {final_output_path}")
     except subprocess.CalledProcessError as exc:
         error_msg = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else "Unknown error"
@@ -138,12 +165,27 @@ def validate_final_media(video_path: str, audio_path: str):
     video_info = probe_media(video_path)
     audio_info = probe_media(audio_path)
 
-    if video_info["height"] < 720:
+    if video_info["height"] < MIN_VIDEO_HEIGHT:
         raise ValueError("Final video does not meet the minimum 720p requirement.")
-    if audio_info["sample_rate"] < 16000:
+    if audio_info["sample_rate"] < MIN_AUDIO_SAMPLE_RATE:
         raise ValueError("Audio sample rate is below the 16kHz requirement.")
-    if video_info["duration_seconds"] > 30 * 60:
+    if video_info["duration_seconds"] > MAX_VIDEO_DURATION_SECONDS:
         raise ValueError("Final video exceeds the 30 minute limit.")
+    if file_size_bytes(video_path) > MAX_VIDEO_SIZE_BYTES:
+        raise ValueError("Final video exceeds the 3GB file size limit.")
+
+
+def validate_supporting_files(subtitle_path: str | None, supplementary_paths: list[str]):
+    if len(supplementary_paths) > MAX_SUPPLEMENTARY_FILES:
+        raise ValueError("Supplementary file count exceeds the limit of 5.")
+
+    relevant_paths = []
+    if subtitle_path:
+        relevant_paths.append(subtitle_path)
+    relevant_paths.extend(supplementary_paths)
+
+    if total_size_bytes(relevant_paths) > MAX_SUPPORTING_FILES_BYTES:
+        raise ValueError("Subtitle and supplementary files exceed the 100MB combined limit.")
 
 
 def format_vtt_timestamp(total_seconds: float) -> str:

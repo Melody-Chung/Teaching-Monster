@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from manim_engine import (
@@ -15,8 +18,12 @@ from media_utils import (
     merge_video_and_audio,
     probe_media,
     validate_final_media,
+    validate_supporting_files,
     write_vtt_from_segments,
 )
+
+MAX_REQUEST_RUNTIME_SECONDS = int(os.getenv("MAX_REQUEST_RUNTIME_SECONDS", "1740"))
+OUTPUT_RETENTION_HOURS = int(os.getenv("OUTPUT_RETENTION_HOURS", "72"))
 
 
 def sanitize_request_id(request_id: str) -> str:
@@ -35,13 +42,41 @@ def load_json(path: Path) -> dict:
         return json.load(file)
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 class TeachingVideoPipeline:
     def __init__(self, output_root: str = "outputs", max_manim_retries: int = 2):
         self.output_root = Path(output_root)
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.max_manim_retries = max_manim_retries
 
+    def ensure_within_runtime_limit(self, start_time: float, stage_name: str):
+        elapsed = time.monotonic() - start_time
+        if elapsed > MAX_REQUEST_RUNTIME_SECONDS:
+            raise TimeoutError(f"Pipeline exceeded the time limit during '{stage_name}'.")
+
+    def build_request_metadata(self, safe_request_id: str, course_requirement: str, student_persona: str) -> dict:
+        available_until = datetime.now(timezone.utc) + timedelta(hours=OUTPUT_RETENTION_HOURS)
+        return {
+            "request_id": safe_request_id,
+            "course_requirement": course_requirement,
+            "student_persona": student_persona,
+            "created_at_utc": utc_now_iso(),
+            "available_until_utc": available_until.isoformat(),
+            "retention_hours": OUTPUT_RETENTION_HOURS,
+            "generation_policy": {
+                "full_automation": True,
+                "external_media_sources_used": False,
+                "source_attribution_required": "No external third-party assets are fetched by this pipeline.",
+                "llm_service": os.getenv("GEMINI_MODEL", "gemini-3-flash-preview"),
+                "tts_service": "edge-tts",
+            },
+        }
+
     def run(self, request_id: str, course_requirement: str, student_persona: str) -> dict:
+        start_time = time.monotonic()
         safe_request_id = sanitize_request_id(request_id)
         request_dir = self.output_root / safe_request_id
         request_dir.mkdir(parents=True, exist_ok=True)
@@ -58,31 +93,33 @@ class TeachingVideoPipeline:
         subtitle_path = request_dir / "subtitles.vtt"
 
         save_json(
-            {
-                "request_id": safe_request_id,
-                "course_requirement": course_requirement,
-                "student_persona": student_persona,
-            },
+            self.build_request_metadata(safe_request_id, course_requirement, student_persona),
             request_meta_path,
         )
 
         if final_video_path.exists() and subtitle_path.exists():
+            validate_final_media(str(final_video_path), str(audio_path))
+            validate_supporting_files(str(subtitle_path), [])
             return {
                 "request_id": safe_request_id,
                 "request_dir": str(request_dir),
                 "final_video_path": str(final_video_path),
                 "subtitle_path": str(subtitle_path),
+                "supplementary_paths": [],
                 "outline_path": str(outline_path),
                 "storyboard_path": str(storyboard_path),
                 "manim_bundle_path": str(manim_bundle_path),
+                "request_meta_path": str(request_meta_path),
             }
 
+        self.ensure_within_runtime_limit(start_time, "startup")
         if outline_path.exists():
             outline = load_json(outline_path)
         else:
             outline = generate_course_outline(course_requirement, student_persona)
             save_json(outline, outline_path)
 
+        self.ensure_within_runtime_limit(start_time, "outline generation")
         if storyboard_path.exists():
             storyboard = load_json(storyboard_path)
         else:
@@ -96,22 +133,30 @@ class TeachingVideoPipeline:
         ]
         target_duration_seconds = max(sum(max(value, 6) for value in estimated_segment_durations), 20)
 
+        self.ensure_within_runtime_limit(start_time, "storyboard generation")
         if manim_bundle_path.exists():
             manim_bundle = load_json(manim_bundle_path)
         else:
             manim_bundle = generate_manim_lesson(storyboard, target_duration_seconds)
             save_json(manim_bundle, manim_bundle_path)
 
+        self.ensure_within_runtime_limit(start_time, "manim script generation")
         if not audio_path.exists():
-            generate_english_audio(voiceover_text, str(audio_path))
+            remaining_budget = max(60, int(MAX_REQUEST_RUNTIME_SECONDS - (time.monotonic() - start_time)))
+            generate_english_audio(voiceover_text, str(audio_path), timeout_seconds=min(remaining_budget, 600))
 
         actual_raw_video_path = None
         latest_bundle = manim_bundle
-        repair_context = None
 
         for attempt in range(1, self.max_manim_retries + 2):
+            self.ensure_within_runtime_limit(start_time, f"manim render attempt {attempt}")
             try:
-                actual_raw_video_path = render_manim_code(latest_bundle["manim_code"], str(raw_video_path))
+                remaining_budget = max(120, int(MAX_REQUEST_RUNTIME_SECONDS - (time.monotonic() - start_time)))
+                actual_raw_video_path = render_manim_code(
+                    latest_bundle["manim_code"],
+                    str(raw_video_path),
+                    timeout_seconds=min(remaining_budget, 1200),
+                )
                 save_json(latest_bundle, manim_bundle_path)
                 break
             except ManimRenderError as exc:
@@ -131,19 +176,30 @@ class TeachingVideoPipeline:
         if actual_raw_video_path is None:
             raise RuntimeError("Failed to render Manim video after retries.")
 
-        merge_video_and_audio(actual_raw_video_path, str(audio_path), str(final_video_path))
+        self.ensure_within_runtime_limit(start_time, "audio-video merge")
+        remaining_budget = max(120, int(MAX_REQUEST_RUNTIME_SECONDS - (time.monotonic() - start_time)))
+        merge_video_and_audio(
+            actual_raw_video_path,
+            str(audio_path),
+            str(final_video_path),
+            timeout_seconds=min(remaining_budget, 600),
+        )
 
         final_duration = probe_media(str(final_video_path))["duration_seconds"]
         subtitle_segments = estimate_segments_to_total_duration(narration_segments, final_duration)
         write_vtt_from_segments(subtitle_segments, str(subtitle_path))
         validate_final_media(str(final_video_path), str(audio_path))
+        validate_supporting_files(str(subtitle_path), [])
 
+        self.ensure_within_runtime_limit(start_time, "final validation")
         return {
             "request_id": safe_request_id,
             "request_dir": str(request_dir),
             "final_video_path": str(final_video_path),
             "subtitle_path": str(subtitle_path),
+            "supplementary_paths": [],
             "outline_path": str(outline_path),
             "storyboard_path": str(storyboard_path),
             "manim_bundle_path": str(manim_bundle_path),
+            "request_meta_path": str(request_meta_path),
         }

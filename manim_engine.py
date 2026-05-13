@@ -18,7 +18,7 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 OUTPUT_ROOT = Path("outputs")
 
 
@@ -91,12 +91,18 @@ Return exactly one JSON object with these keys:
 - "course_title": short English title
 - "audience_summary": concise summary of the learner
 - "teaching_goals": list of 3 to 5 learning goals
+- "prior_knowledge_assumptions": list of learner knowledge we can safely assume
+- "forbidden_knowledge": list of ideas or formalisms that are too advanced unless carefully introduced
+- "core_analogy": one high-quality analogy grounded in the learner's experience
+- "factual_guardrails": list of factual or mathematical claims that must be handled carefully
 - "sections": list of 3 to 6 section objects
 
 Each section object must contain:
 - "title"
 - "goal"
+- "bridge_from_previous": how this section connects from what the learner already knows
 - "key_points": list of teaching points
+- "why_it_matters_to_learner": short learner-centered motivation
 - "visual_focus": how the visuals should support this section
 - "misconception_to_fix": one likely misconception
 
@@ -105,12 +111,24 @@ Rules:
 - Target secondary-school or intro college clarity
 - Follow the requirement strictly
 - Keep the plan lecture-friendly and suitable for a 30 minute max video
+- Zero-hallucination mindset: do not invent theorems, citations, historical claims, datasets, or formulas
+- Prefer simple, verified, canonical explanations over flashy but risky claims
+- Build the lesson from known ideas toward new ideas with explicit scaffolding
 
 Return JSON only.
 """
     return generate_json_with_gemini(
         prompt,
-        required_keys=["course_title", "audience_summary", "teaching_goals", "sections"],
+        required_keys=[
+            "course_title",
+            "audience_summary",
+            "teaching_goals",
+            "prior_knowledge_assumptions",
+            "forbidden_knowledge",
+            "core_analogy",
+            "factual_guardrails",
+            "sections",
+        ],
     )
 
 
@@ -133,12 +151,19 @@ Return exactly one JSON object with these keys:
 Each slide object must contain:
 - "slide_id": "slide1", "slide2", ...
 - "title": short title
+- "teaching_purpose": what conceptual job this slide performs
+- "bridge_from_prior": how this slide starts from what the learner already understands
 - "onscreen_text": list of short bullet-sized strings
 - "visual_plan": detailed description of what should appear on screen
+- "narrative_hook": one attention-maintaining move such as curiosity, contrast, or a motivating question
+- "analogy_or_example": one learner-appropriate analogy, concrete example, or intuition anchor
 - "narration": spoken script for this slide
+- "mini_recap": one or two sentences summarizing what the learner should now understand
 - "formula": LaTeX string or null
 - "estimated_seconds": integer estimate for this slide narration duration
 - "cursor_hint": what area of the slide the audience should focus on
+- "fact_check_notes": list of short notes describing which claims must stay precise
+- "source_note": either "original explanation" or a short attribution note if an external fact is explicitly referenced
 
 Rules:
 - 4 to 8 slides total
@@ -146,6 +171,10 @@ Rules:
 - Narration should be engaging but concise
 - On-screen text must stay short and readable
 - Visual plan should fit a 3Blue1Brown / teaching animation style
+- Every slide must clearly connect to the student persona and avoid abrupt jumps in difficulty
+- Use staged teaching: intuition first, then structure, then formalization, then recap
+- Do not fabricate citations, named studies, or specific statistics unless truly necessary and widely canonical
+- The last slide must contain a clean summary and one transfer idea for the learner
 
 Return JSON only.
 """
@@ -153,6 +182,27 @@ Return JSON only.
     slides = data.get("slides", [])
     if not isinstance(slides, list) or not slides:
         raise ValueError("Storyboard must contain a non-empty 'slides' list.")
+    required_slide_keys = {
+        "slide_id",
+        "title",
+        "teaching_purpose",
+        "bridge_from_prior",
+        "onscreen_text",
+        "visual_plan",
+        "narrative_hook",
+        "analogy_or_example",
+        "narration",
+        "mini_recap",
+        "formula",
+        "estimated_seconds",
+        "cursor_hint",
+        "fact_check_notes",
+        "source_note",
+    }
+    for slide in slides:
+        missing = required_slide_keys.difference(slide.keys())
+        if missing:
+            raise ValueError(f"Storyboard slide is missing required keys: {sorted(missing)}")
     return data
 
 
@@ -180,14 +230,18 @@ Rules for the code:
 - Must start with `from manim import *`
 - Must define exactly one class `GeneratedScene(Scene)`
 - Use the storyboard slide order faithfully
+- Reflect the pedagogical structure in the storyboard: hook, scaffold, example, recap
 - Build visuals from shapes, text, arrows, tables, coordinate planes, braces, highlights, and LaTeX
 - Avoid external images, internet assets, or local file dependencies
 - Keep text readable at 720p
 - Use separate visual beats for each slide/section
+- Make the visuals synchronize with the narration emphasis: when the narration introduces a contrast, comparison, misconception, or formula, the animation should highlight that exact element at the same moment
+- Use the slide `cursor_hint`, `narrative_hook`, `analogy_or_example`, and `mini_recap` fields as guidance for pacing and emphasis
 - Use waits and pacing so the animation is long enough for the target duration
 - Only use Manim functions and rate functions that are known to exist in standard `from manim import *`
 - Prefer `linear`, `smooth`, `there_and_back`, or omit `rate_func` entirely
 - Use `Group` instead of `VGroup` when collecting arbitrary `self.mobjects`
+- Do not include unsupported claims, fake citations, or decorative visuals that do not help comprehension
 - End with a short final pause
 """
 

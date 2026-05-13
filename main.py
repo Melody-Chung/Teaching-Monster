@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +15,7 @@ app = FastAPI(title="Teaching Monster API", version="1.0.0")
 app.mount("/outputs", StaticFiles(directory=OUTPUT_ROOT), name="outputs")
 
 pipeline = TeachingVideoPipeline(output_root=str(OUTPUT_ROOT))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
 
 class TeachingRequest(BaseModel):
@@ -30,7 +32,8 @@ class TeachingResponse(BaseModel):
 
 def build_public_url(request: Request, file_path: Path) -> str:
     relative_path = file_path.relative_to(OUTPUT_ROOT).as_posix()
-    return f"{str(request.base_url).rstrip('/')}/outputs/{relative_path}"
+    base_url = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    return f"{base_url}/outputs/{relative_path}"
 
 
 @app.get("/health")
@@ -64,12 +67,11 @@ def generate_educational_video(payload: TeachingRequest, request: Request):
         return TeachingResponse(
             video_url=build_public_url(request, Path(result["final_video_path"])),
             subtitle_url=build_public_url(request, Path(result["subtitle_path"])),
-            supplementary_url=[
-                build_public_url(request, Path(result["outline_path"])),
-                build_public_url(request, Path(result["storyboard_path"])),
-                build_public_url(request, Path(result["manim_bundle_path"])),
-            ],
+            supplementary_url=[],
         )
+    except TimeoutError as exc:
+        print(f"Pipeline timed out: {exc}")
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     except (KeyError, ValueError, RuntimeError) as exc:
         print(f"Pipeline validation failed: {exc}")
         raise HTTPException(status_code=422, detail=str(exc)) from exc
