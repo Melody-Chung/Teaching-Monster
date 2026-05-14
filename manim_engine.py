@@ -376,6 +376,7 @@ Rules:
 - If a concept needs more time, split it across consecutive slides rather than making one long slide
 - Every slide must clearly connect to the student persona and avoid abrupt jumps in difficulty
 - Use staged teaching: intuition first, then structure, then formalization, then recap
+- Student-facing content must never show internal instructional-design language such as "bridge from prior", "teaching purpose", "this slide does", or meta commentary for content developers
 - Do not fabricate citations, named studies, or specific statistics unless truly necessary and widely canonical
 - The last slide must contain a clean summary and one transfer idea for the learner
 
