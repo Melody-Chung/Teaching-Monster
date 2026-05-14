@@ -99,7 +99,7 @@ def _font_size_for_length(text: str, default: int, medium_threshold: int, small_
     return default
 
 
-def _sanitize_display_text(value) -> str:
+def _sanitize_display_text_legacy_1(value) -> str:
     text = unicodedata.normalize("NFKC", _safe_str(value))
     replacements = {
         "**": "",
@@ -126,7 +126,7 @@ def _sanitize_display_text(value) -> str:
     return text
 
 
-def _sanitize_display_text(value) -> str:
+def _sanitize_display_text_legacy_2(value) -> str:
     text = unicodedata.normalize("NFKC", _safe_str(value))
     replacements = {
         "**": "",
@@ -506,6 +506,26 @@ def _draw_text_explanation_panel(draw: ImageDraw.ImageDraw, slide: dict, box: tu
         _draw_formula_card(draw, (text_x, formula_box_top, x1 - 28, formula_box_top + 58), formula, small_font)
 
 
+def _draw_neutral_visual_panel(draw: ImageDraw.ImageDraw, slide: dict, box: tuple[int, int, int, int], small_font, body_font):
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle(box, radius=28, fill="#FAF6EF", outline=BORDER_COLOR, width=2)
+    draw.text((x0 + 18, y0 + 16), "Focus", font=small_font, fill=ACCENT_COLOR)
+    inner = (x0 + 42, y0 + 72, x1 - 42, y1 - 42)
+    draw.rounded_rectangle(inner, radius=20, fill="#FFF8EF", outline=BORDER_COLOR, width=2)
+
+    title = _fit_text_block(draw, slide.get("title", "Key Idea"), body_font, inner[2] - inner[0] - 36, 2)
+    _draw_wrapped_text(draw, title, (inner[0] + 18, inner[1] + 18), body_font, TEXT_COLOR, inner[2] - inner[0] - 36, line_gap=6, max_lines=2)
+
+    current_y = inner[1] + 94
+    for line in _explanation_blocks(slide)[:2]:
+        current_y = _draw_wrapped_text(draw, line, (inner[0] + 18, current_y), small_font, MUTED_TEXT_COLOR, inner[2] - inner[0] - 36, line_gap=6, max_lines=2) + 10
+
+    formula = prettify_formula(slide.get("formula"))
+    if formula:
+        formula_top = min(current_y + 8, inner[3] - 76)
+        _draw_formula_card(draw, (inner[0] + 18, formula_top, inner[2] - 18, formula_top + 58), formula, small_font)
+
+
 def _draw_visual_scene(draw: ImageDraw.ImageDraw, slide: dict, box: tuple[int, int, int, int], small_font, body_font):
     x0, y0, x1, y1 = box
     draw.rounded_rectangle(box, radius=28, fill="#FAF6EF", outline=BORDER_COLOR, width=2)
@@ -524,7 +544,7 @@ def _draw_visual_scene(draw: ImageDraw.ImageDraw, slide: dict, box: tuple[int, i
     elif any(token in blob for token in ["recap", "summary", "everywhere", "real world", "rocket"]):
         _draw_scene_recap(draw, box, small_font, body_font)
     else:
-        _draw_scene_force_intro(draw, box, small_font)
+        _draw_neutral_visual_panel(draw, slide, box, small_font, body_font)
 
     caption = _truncate_clean(_sanitize_display_text(slide.get("visual_plan", "")), 40)
     if caption:
