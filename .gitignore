@@ -2,3 +2,5 @@ outputs/
 __pycache__/
 temp_*.py
 .env
+.env.*
+!.env.example
