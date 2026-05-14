@@ -1,5 +1,6 @@
 import html
 import re
+import unicodedata
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -77,11 +78,73 @@ def _safe_str(value) -> str:
     return "" if value is None else str(value)
 
 
+def _sanitize_display_text(value) -> str:
+    text = unicodedata.normalize("NFKC", _safe_str(value))
+    replacements = {
+        "**": "",
+        "__": "",
+        "`": "",
+        "∝": " proportional to ",
+        "×": " x ",
+        "·": " * ",
+        "•": "-",
+        "→": " -> ",
+        "⇒": " => ",
+        "≤": " <= ",
+        "≥": " >= ",
+        "≈": " ~ ",
+        "²": "^2",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _compact_bullets(items, limit: int = 3, max_length: int = 38) -> list[str]:
+    results: list[str] = []
+    for item in items or []:
+        if not item:
+            continue
+        results.append(_truncate(_sanitize_display_text(item), max_length))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _explanation_blocks(slide: dict) -> list[str]:
+    blocks: list[str] = []
+
+    bridge = _truncate(_sanitize_display_text(slide.get("bridge_from_prior", "")), 90)
+    if bridge:
+        blocks.append(bridge)
+
+    bullets = _compact_bullets(slide.get("onscreen_text", []), limit=2, max_length=28)
+    if bullets:
+        blocks.extend([f"- {item}" for item in bullets])
+
+    if len(blocks) < 3:
+        example = _truncate(_sanitize_display_text(slide.get("analogy_or_example", "")), 72)
+        if example:
+            blocks.append(f"Example: {example}")
+
+    if len(blocks) < 3:
+        focus = _truncate(_sanitize_display_text(slide.get("visual_plan", "")), 68)
+        if focus:
+            blocks.append(f"Focus: {focus}")
+
+    return blocks[:3]
+
+
 def prettify_formula(formula: str | None) -> str:
     if not formula:
         return ""
 
-    text = str(formula)
+    text = _sanitize_display_text(formula)
     previous = None
     while previous != text:
         previous = text
@@ -89,7 +152,7 @@ def prettify_formula(formula: str | None) -> str:
 
     replacements = [
         (r"\times", " x "),
-        (r"\cdot", " · "),
+        (r"\cdot", " * "),
         (r"\over", " / "),
         (r"\frac", ""),
         (r"\text{net}", "net"),
@@ -252,6 +315,27 @@ def _draw_scene_recap(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int],
     draw.text((x0 + 318, y0 + 274), "force drives motion", font=small_font, fill=ACCENT_COLOR)
 
 
+def _draw_text_explanation_panel(draw: ImageDraw.ImageDraw, slide: dict, box: tuple[int, int, int, int], small_font, body_font):
+    x0, y0, x1, y1 = box
+    draw.rounded_rectangle(box, radius=28, fill="#FAF6EF", outline=BORDER_COLOR, width=2)
+    draw.text((x0 + 18, y0 + 16), "Explanation", font=small_font, fill=ACCENT_COLOR)
+
+    text_x = x0 + 28
+    text_width = x1 - x0 - 56
+    current_y = y0 + 54
+
+    blocks = _explanation_blocks(slide)
+    if blocks:
+        current_y = _draw_wrapped_text(draw, blocks[0], (text_x, current_y), small_font, MUTED_TEXT_COLOR, text_width, line_gap=5) + 12
+        for line in blocks[1:]:
+            current_y = _draw_wrapped_text(draw, line, (text_x, current_y), body_font, TEXT_COLOR, text_width, line_gap=6) + 10
+
+    formula = prettify_formula(slide.get("formula"))
+    if formula:
+        formula_box_top = min(current_y + 6, y1 - 104)
+        _draw_formula_card(draw, (text_x, formula_box_top, x1 - 28, formula_box_top + 58), formula, small_font)
+
+
 def _draw_visual_scene(draw: ImageDraw.ImageDraw, slide: dict, box: tuple[int, int, int, int], small_font, body_font):
     x0, y0, x1, y1 = box
     draw.rounded_rectangle(box, radius=28, fill="#FAF6EF", outline=BORDER_COLOR, width=2)
@@ -332,7 +416,7 @@ def build_slides_prompt(storyboard: dict) -> dict:
                 "onscreen_text": bullet_items,
                 "formula": _safe_str(slide.get("formula")),
                 "cursor_hint": _safe_str(slide.get("cursor_hint")),
-                "render_template": "visual_first_two_column_card",
+                "render_template": "text_explainer_two_column_card",
             }
         )
     return {"render_mode": "html_css_slides", "slides_prompt": slide_prompts}
@@ -428,10 +512,14 @@ def build_mouse_paths(storyboard: dict, slide_durations: list[float]) -> dict:
 def build_slide_html(outline: dict, storyboard: dict) -> str:
     cards = []
     for slide in storyboard.get("slides", []):
-        bullet_items = [str(item) for item in slide.get("onscreen_text", [])[:4] if item]
+        bullet_items = _compact_bullets(slide.get("onscreen_text", []), limit=3, max_length=24)
         bullets = "".join(f"<li>{html.escape(item)}</li>" for item in bullet_items)
         formula = slide.get("formula")
         formula_html = f"<div class='formula'>{html.escape(prettify_formula(formula))}</div>" if formula else ""
+        explanation_items = _explanation_blocks(slide)
+        explanation_html = "".join(
+            f"<p>{html.escape(item)}</p>" for item in explanation_items
+        )
         cards.append(
             f"""
             <section class="slide">
@@ -439,15 +527,14 @@ def build_slide_html(outline: dict, storyboard: dict) -> str:
               <h2>{html.escape(_safe_str(slide.get("title", "Slide")))}</h2>
               <div class="columns">
                 <div class="left">
-                  <p class="hook">{html.escape(_truncate(_safe_str(slide.get("narrative_hook", "")), 120))}</p>
+                  <p class="hook">{html.escape(_truncate(_sanitize_display_text(slide.get("narrative_hook", "")), 72))}</p>
                   <ul>{bullets}</ul>
                   {formula_html}
-                  <p class="recap">{html.escape(_truncate(_safe_str(slide.get("mini_recap", "")), 150))}</p>
+                  <p class="recap">{html.escape(_truncate(_sanitize_display_text(slide.get("mini_recap", "")), 72))}</p>
                 </div>
-                <div class="right visual-panel">
-                  <div class="visual-title">Visual Focus</div>
-                  <p>{html.escape(_truncate(_safe_str(slide.get("visual_plan", "")), 150))}</p>
-                  <p><strong>Example:</strong> {html.escape(_truncate(_safe_str(slide.get("analogy_or_example", "")), 80))}</p>
+                <div class="right visual-panel text-panel">
+                  <div class="visual-title">Explanation</div>
+                  {explanation_html}
                 </div>
               </div>
             </section>
@@ -529,6 +616,10 @@ def build_slide_html(outline: dict, storyboard: dict) -> str:
       background: linear-gradient(180deg, #fbf7f0, #f5ede1);
       padding: 20px 24px;
     }}
+    .text-panel p {{
+      font-size: 21px;
+      margin: 0 0 14px 0;
+    }}
     .visual-title {{
       color: var(--accent);
       font-size: 18px;
@@ -566,8 +657,8 @@ def render_storyboard_to_images(storyboard: dict, output_dir: str) -> list[str]:
 
         draw.rounded_rectangle((36, 30, SLIDE_WIDTH - 36, SLIDE_HEIGHT - 30), radius=28, fill=PANEL_COLOR, outline=BORDER_COLOR, width=3)
         draw.rounded_rectangle((52, 48, SLIDE_WIDTH - 52, 108), radius=18, fill="#FFF5EA")
-        draw.text((74, 66), _truncate(slide.get("teaching_purpose", "").upper(), 88), font=eyebrow_font, fill=ACCENT_COLOR)
-        draw.text((72, 120), _truncate(slide.get("title", f"Slide {index}"), 42), font=title_font, fill=TEXT_COLOR)
+        draw.text((74, 66), _truncate(_sanitize_display_text(slide.get("teaching_purpose", "")).upper(), 74), font=eyebrow_font, fill=ACCENT_COLOR)
+        draw.text((72, 120), _truncate(_sanitize_display_text(slide.get("title", f"Slide {index}")), 34), font=title_font, fill=TEXT_COLOR)
 
         left_x = 78
         left_width = 320
@@ -577,12 +668,12 @@ def render_storyboard_to_images(storyboard: dict, output_dir: str) -> list[str]:
 
         hook_box = (left_x, top_y, left_x + left_width, top_y + 88)
         draw.rounded_rectangle(hook_box, radius=18, fill="#F7EBDD")
-        _draw_wrapped_text(draw, _truncate(slide.get("narrative_hook", ""), 110), (left_x + 18, top_y + 16), small_font, MUTED_TEXT_COLOR, left_width - 36, line_gap=5)
+        _draw_wrapped_text(draw, _truncate(_sanitize_display_text(slide.get("narrative_hook", "")), 72), (left_x + 18, top_y + 16), small_font, MUTED_TEXT_COLOR, left_width - 36, line_gap=5)
 
         bullet_y = top_y + 122
-        for item in [str(item) for item in slide.get("onscreen_text", [])[:4] if item]:
+        for item in _compact_bullets(slide.get("onscreen_text", []), limit=3, max_length=24):
             draw.ellipse((left_x, bullet_y + 12, left_x + 10, bullet_y + 22), fill=ACCENT_COLOR)
-            bullet_y = _draw_wrapped_text(draw, _truncate(item, 70), (left_x + 24, bullet_y), body_font, TEXT_COLOR, left_width - 24, line_gap=6) + 8
+            bullet_y = _draw_wrapped_text(draw, item, (left_x + 24, bullet_y), body_font, TEXT_COLOR, left_width - 24, line_gap=6) + 8
 
         formula = slide.get("formula")
         if formula:
@@ -590,14 +681,14 @@ def render_storyboard_to_images(storyboard: dict, output_dir: str) -> list[str]:
             formula_box = (left_x, formula_top, left_x + left_width, formula_top + 64)
             _draw_formula_card(draw, formula_box, formula, small_font)
 
-        _draw_visual_scene(draw, slide, visual_box, eyebrow_font, body_font)
+        _draw_text_explanation_panel(draw, slide, visual_box, eyebrow_font, body_font)
 
         recap_top = 568
         recap_bottom = SLIDE_HEIGHT - 82
         recap_box = (64, recap_top, SLIDE_WIDTH - 64, recap_bottom)
         draw.rounded_rectangle(recap_box, radius=22, fill="#FCF4EA")
         draw.text((84, recap_top + 16), "Mini Recap", font=eyebrow_font, fill=ACCENT_COLOR)
-        _draw_wrapped_text(draw, _truncate(slide.get("mini_recap", ""), 110), (84, recap_top + 46), recap_font, TEXT_COLOR, SLIDE_WIDTH - 168, line_gap=6)
+        _draw_wrapped_text(draw, _truncate(_sanitize_display_text(slide.get("mini_recap", "")), 72), (84, recap_top + 46), recap_font, TEXT_COLOR, SLIDE_WIDTH - 168, line_gap=6)
 
         image_path = output_path / f"slide_{index:02}.png"
         image.save(image_path)

@@ -208,6 +208,86 @@ def validate_storyboard_data(data: dict) -> dict:
     return data
 
 
+def _split_sentences(text: str) -> list[str]:
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _split_slide_for_pacing(slide: dict) -> tuple[dict, dict] | None:
+    bullets = [str(item).strip() for item in slide.get("onscreen_text", []) if str(item).strip()]
+    sentences = _split_sentences(slide.get("narration", ""))
+    estimated = int(slide.get("estimated_seconds", 0) or 0)
+
+    if len(bullets) < 2 and len(sentences) < 4 and estimated <= 22:
+        return None
+
+    bullet_mid = max(1, len(bullets) // 2)
+    sentence_mid = max(1, len(sentences) // 2)
+
+    first_bullets = bullets[:bullet_mid] or bullets[:1]
+    second_bullets = bullets[bullet_mid:] or bullets[-1:]
+    first_sentences = sentences[:sentence_mid] or sentences[:1]
+    second_sentences = sentences[sentence_mid:] or sentences[-1:]
+
+    first_slide = dict(slide)
+    second_slide = dict(slide)
+
+    first_slide["title"] = f"{slide.get('title', 'Slide')} (1)"
+    second_slide["title"] = f"{slide.get('title', 'Slide')} (2)"
+    first_slide["onscreen_text"] = first_bullets[:3]
+    second_slide["onscreen_text"] = second_bullets[:3]
+    first_slide["narration"] = " ".join(first_sentences).strip()
+    second_slide["narration"] = " ".join(second_sentences).strip()
+    first_slide["mini_recap"] = "Key setup before the next step."
+    second_slide["bridge_from_prior"] = "Continue directly from the previous slide."
+    second_slide["narrative_hook"] = "Now let's complete the idea."
+
+    if first_slide.get("formula"):
+        first_slide["formula"] = None
+
+    first_seconds = max(8, estimated // 2) if estimated else max(8, len(first_slide["narration"].split()) // 3)
+    second_seconds = max(8, estimated - first_seconds) if estimated else max(8, len(second_slide["narration"].split()) // 3)
+    first_slide["estimated_seconds"] = min(first_seconds, 20)
+    second_slide["estimated_seconds"] = min(max(second_seconds, 8), 20)
+
+    return first_slide, second_slide
+
+
+def normalize_storyboard_for_pacing(data: dict, min_slides: int = 7) -> dict:
+    slides = [dict(slide) for slide in data.get("slides", [])]
+    if not slides:
+        return data
+
+    changed = True
+    while changed and len(slides) < min_slides:
+        changed = False
+        candidate_index = max(
+            range(len(slides)),
+            key=lambda i: (
+                int(slides[i].get("estimated_seconds", 0) or 0),
+                len(_split_sentences(slides[i].get("narration", ""))),
+                len(slides[i].get("onscreen_text", [])),
+            ),
+        )
+        split_pair = _split_slide_for_pacing(slides[candidate_index])
+        if split_pair is None:
+            break
+        slides = slides[:candidate_index] + [split_pair[0], split_pair[1]] + slides[candidate_index + 1 :]
+        changed = True
+
+    for index, slide in enumerate(slides, start=1):
+        slide["slide_id"] = f"slide{index}"
+        slide["estimated_seconds"] = int(max(8, min(int(slide.get("estimated_seconds", 12) or 12), 20)))
+        slide["onscreen_text"] = [str(item).strip() for item in slide.get("onscreen_text", []) if str(item).strip()][:3]
+        slide["narration"] = " ".join(str(slide.get("narration", "")).split())
+        slide["mini_recap"] = " ".join(str(slide.get("mini_recap", "")).split())
+
+    return {"slides": slides}
+
+
 def build_outline_prompt(course_requirement: str, student_persona: str) -> str:
     return f"""
 You are an expert curriculum designer for the Teaching Monster competition.
@@ -284,13 +364,16 @@ Each slide object must contain:
 - "source_note": either "original explanation" or a short attribution note if an external fact is explicitly referenced
 
 Rules:
-- 4 to 8 slides total
+- 7 to 10 slides total
 - English only
 - Narration should be engaging but concise
 - On-screen text must stay short and readable
 - Limit `onscreen_text` to 2 to 4 bullets, each usually under 7 words
 - `visual_plan` should describe concrete objects and motion cues, not a long paragraph
 - Prefer visual explanation over text density
+- Prefer one micro-idea per slide instead of packing many ideas into one slide
+- Typical `estimated_seconds` should be about 8 to 18 seconds per slide
+- If a concept needs more time, split it across consecutive slides rather than making one long slide
 - Every slide must clearly connect to the student persona and avoid abrupt jumps in difficulty
 - Use staged teaching: intuition first, then structure, then formalization, then recap
 - Do not fabricate citations, named studies, or specific statistics unless truly necessary and widely canonical
@@ -307,7 +390,7 @@ def generate_course_outline(course_requirement: str, student_persona: str) -> di
 
 def generate_storyboard(outline: dict, course_requirement: str, student_persona: str) -> dict:
     data = generate_json_with_gemini(build_storyboard_prompt(outline, course_requirement, student_persona))
-    return validate_storyboard_data(data)
+    return normalize_storyboard_for_pacing(validate_storyboard_data(data))
 
 
 def generate_outline_and_storyboard(course_requirement: str, student_persona: str) -> tuple[dict, dict]:
@@ -339,7 +422,7 @@ Global rules:
 """
     data = generate_json_with_gemini(prompt, required_keys=["outline", "storyboard"])
     outline = validate_outline_data(data["outline"])
-    storyboard = validate_storyboard_data(data["storyboard"])
+    storyboard = normalize_storyboard_for_pacing(validate_storyboard_data(data["storyboard"]))
     return outline, storyboard
 
 

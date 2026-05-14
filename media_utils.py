@@ -16,8 +16,7 @@ MAX_VIDEO_SIZE_BYTES = 3 * 1024 * 1024 * 1024
 MAX_SUPPORTING_FILES_BYTES = 100 * 1024 * 1024
 MAX_SUPPLEMENTARY_FILES = 5
 TTS_MAX_CHARS_PER_CHUNK = 1200
-SLIDESHOW_FPS = 6
-MAX_SLIDE_FRAMES = 18
+SLIDESHOW_FPS = 4
 
 
 def ensure_command_available(command_name: str):
@@ -228,7 +227,7 @@ def create_slideshow_video(
     for slide_index, (image_path, duration) in enumerate(zip(image_paths, durations)):
         base_image = Image.open(image_path).convert("RGB")
         width, height = base_image.size
-        total_frames = min(max(int(round(max(duration, 1.0) * fps)), 1), MAX_SLIDE_FRAMES)
+        total_frames = max(int(round(max(duration, 1.0) * fps)), 1)
         track = slide_tracks[slide_index] if slide_index < len(slide_tracks) else {"points": []}
 
         for local_frame in range(total_frames):

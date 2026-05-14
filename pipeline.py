@@ -165,8 +165,6 @@ class TeachingVideoPipeline:
         self.ensure_within_runtime_limit(start_time, "storyboard generation")
         save_json(build_slides_prompt(storyboard), slides_prompt_path)
         save_json(build_page_scripts(storyboard), page_scripts_path)
-        mouse_path_data = build_mouse_paths(storyboard, slide_durations)
-        save_json(mouse_path_data, mouse_path_path)
 
         if not slides_markdown_path.exists():
             slides_markdown_path.write_text(build_marp_markdown(outline, storyboard), encoding="utf-8")
@@ -183,7 +181,29 @@ class TeachingVideoPipeline:
                 debug_output_dir=str(intermediates_dir),
             )
 
+        audio_duration = max(probe_media(str(audio_path))["duration_seconds"], 1.0)
+        timed_segments = estimate_segments_to_total_duration(narration_segments, audio_duration)
+        if timed_segments and len(timed_segments) == len(narration_segments):
+            slide_durations = [
+                max(float(segment["end"] - segment["start"]), 3.0)
+                for segment in timed_segments
+            ]
+        else:
+            timed_segments = []
+
         self.ensure_within_runtime_limit(start_time, "slide rendering")
+        save_json(
+            {
+                "audio_duration_seconds": audio_duration,
+                "slide_durations_seconds": slide_durations,
+                "timed_segments": timed_segments,
+            },
+            intermediates_dir / "timing.json",
+        )
+
+        mouse_path_data = build_mouse_paths(storyboard, slide_durations)
+        save_json(mouse_path_data, mouse_path_path)
+
         slide_image_paths = render_storyboard_to_images(storyboard, str(slide_images_dir))
         render_bundle = {
             "render_mode": "html_css_slides",
