@@ -5,3 +5,4 @@ manim
 google-genai
 python-dotenv
 edge-tts
+Pillow

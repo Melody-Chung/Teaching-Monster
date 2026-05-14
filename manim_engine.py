@@ -19,6 +19,7 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash-lite")
 OUTPUT_ROOT = Path("outputs")
 
 
@@ -35,50 +36,180 @@ def extract_json_object(raw_text: str) -> dict:
     cleaned = raw_text.strip()
     cleaned = cleaned.replace("```json", "").replace("```", "").strip()
 
+    def repair_json_text(text: str) -> str:
+        # Gemini sometimes returns LaTeX like \text or \frac inside JSON strings
+        # without escaping the backslash for JSON. Preserve valid escapes and
+        # double only the invalid ones.
+        text = re.sub(r"\\(?![\"\\/bfnrtu])", r"\\\\", text)
+        return text
+
+    def extract_first_balanced_json_object(text: str) -> str | None:
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index in range(start, len(text)):
+            char = text[index]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:index + 1]
+
+        return None
+
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if not match:
+        repaired = repair_json_text(cleaned)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+        candidate = extract_first_balanced_json_object(cleaned)
+        if not candidate:
             raise ValueError("LLM response did not contain a JSON object.")
-        return json.loads(match.group(0))
+
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            return json.loads(repair_json_text(candidate))
 
 
 def generate_text_with_gemini(prompt: str, max_attempts: int = 3) -> str:
     last_error = None
+    models_to_try = [DEFAULT_MODEL]
+    if FALLBACK_MODEL and FALLBACK_MODEL not in models_to_try:
+        models_to_try.append(FALLBACK_MODEL)
+    retryable_tokens = [
+        "429",
+        "503",
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "WINERROR 10053",
+        "WINERROR 10054",
+        "CONNECTIONRESETERROR",
+        "CLIENTCONNECTORERROR",
+        "READTIMEDOUT",
+        "TIMED OUT",
+    ]
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = client.models.generate_content(model=DEFAULT_MODEL, contents=prompt)
-            return response.text.strip()
-        except Exception as exc:
-            last_error = exc
-            error_text = str(exc)
-            retryable = any(token in error_text for token in ["429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE"])
-            if not retryable:
-                raise RuntimeError(f"Gemini request failed: {exc}") from exc
-            if attempt == max_attempts:
-                break
-            sleep_seconds = min(15 * attempt, 45)
-            print(f"Gemini request failed on attempt {attempt}/{max_attempts}. Retrying in {sleep_seconds}s...")
-            time.sleep(sleep_seconds)
+    for model_name in models_to_try:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = client.models.generate_content(model=model_name, contents=prompt)
+                return response.text.strip()
+            except Exception as exc:
+                last_error = exc
+                error_text = f"{type(exc).__name__}: {exc}".upper()
+                retryable = any(token in error_text for token in retryable_tokens)
+                if not retryable:
+                    raise RuntimeError(f"Gemini request failed: {exc}") from exc
+                if attempt == max_attempts:
+                    break
+                sleep_seconds = min(15 * attempt, 45)
+                print(
+                    f"Gemini request failed for {model_name} on attempt {attempt}/{max_attempts}. "
+                    f"Retrying in {sleep_seconds}s..."
+                )
+                time.sleep(sleep_seconds)
+
+        if len(models_to_try) > 1 and model_name != models_to_try[-1]:
+            print(f"Switching Gemini model from {model_name} to {models_to_try[-1]} after repeated failures.")
 
     raise RuntimeError(f"Gemini request failed after {max_attempts} attempts: {last_error}") from last_error
 
 
 def generate_json_with_gemini(prompt: str, required_keys: list[str] | None = None) -> dict:
-    data = extract_json_object(generate_text_with_gemini(prompt))
+    last_error: Exception | None = None
 
-    if required_keys:
-        missing = [key for key in required_keys if key not in data]
-        if missing:
-            raise ValueError(f"LLM response is missing required keys: {missing}")
+    for attempt in range(1, 4):
+        raw_text = generate_text_with_gemini(prompt)
+        try:
+            data = extract_json_object(raw_text)
+            if required_keys:
+                missing = [key for key in required_keys if key not in data]
+                if missing:
+                    raise ValueError(f"LLM response is missing required keys: {missing}")
+            return data
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            if attempt == 3:
+                break
+            time.sleep(min(2 * attempt, 5))
 
+    raise ValueError(f"Failed to parse strict JSON from Gemini after retries: {last_error}") from last_error
+
+
+OUTLINE_REQUIRED_KEYS = [
+    "course_title",
+    "audience_summary",
+    "teaching_goals",
+    "prior_knowledge_assumptions",
+    "forbidden_knowledge",
+    "core_analogy",
+    "factual_guardrails",
+    "sections",
+]
+
+
+def validate_outline_data(data: dict) -> dict:
+    missing = [key for key in OUTLINE_REQUIRED_KEYS if key not in data]
+    if missing:
+        raise ValueError(f"Outline is missing required keys: {missing}")
     return data
 
 
-def generate_course_outline(course_requirement: str, student_persona: str) -> dict:
-    prompt = f"""
+def validate_storyboard_data(data: dict) -> dict:
+    if "slides" not in data:
+        raise ValueError("Storyboard is missing required key: slides")
+    slides = data.get("slides", [])
+    if not isinstance(slides, list) or not slides:
+        raise ValueError("Storyboard must contain a non-empty 'slides' list.")
+    required_slide_keys = {
+        "slide_id",
+        "title",
+        "teaching_purpose",
+        "bridge_from_prior",
+        "onscreen_text",
+        "visual_plan",
+        "narrative_hook",
+        "analogy_or_example",
+        "narration",
+        "mini_recap",
+        "formula",
+        "estimated_seconds",
+        "cursor_hint",
+        "fact_check_notes",
+        "source_note",
+    }
+    for slide in slides:
+        missing = required_slide_keys.difference(slide.keys())
+        if missing:
+            raise ValueError(f"Storyboard slide is missing required keys: {sorted(missing)}")
+    return data
+
+
+def build_outline_prompt(course_requirement: str, student_persona: str) -> str:
+    return f"""
 You are an expert curriculum designer for the Teaching Monster competition.
 
 Course requirement:
@@ -117,23 +248,10 @@ Rules:
 
 Return JSON only.
 """
-    return generate_json_with_gemini(
-        prompt,
-        required_keys=[
-            "course_title",
-            "audience_summary",
-            "teaching_goals",
-            "prior_knowledge_assumptions",
-            "forbidden_knowledge",
-            "core_analogy",
-            "factual_guardrails",
-            "sections",
-        ],
-    )
 
 
-def generate_storyboard(outline: dict, course_requirement: str, student_persona: str) -> dict:
-    prompt = f"""
+def build_storyboard_prompt(outline: dict, course_requirement: str, student_persona: str) -> str:
+    return f"""
 You are building a text-to-video lesson pipeline.
 
 Requirement:
@@ -170,7 +288,9 @@ Rules:
 - English only
 - Narration should be engaging but concise
 - On-screen text must stay short and readable
-- Visual plan should fit a 3Blue1Brown / teaching animation style
+- Limit `onscreen_text` to 2 to 4 bullets, each usually under 7 words
+- `visual_plan` should describe concrete objects and motion cues, not a long paragraph
+- Prefer visual explanation over text density
 - Every slide must clearly connect to the student persona and avoid abrupt jumps in difficulty
 - Use staged teaching: intuition first, then structure, then formalization, then recap
 - Do not fabricate citations, named studies, or specific statistics unless truly necessary and widely canonical
@@ -178,32 +298,49 @@ Rules:
 
 Return JSON only.
 """
-    data = generate_json_with_gemini(prompt, required_keys=["slides"])
-    slides = data.get("slides", [])
-    if not isinstance(slides, list) or not slides:
-        raise ValueError("Storyboard must contain a non-empty 'slides' list.")
-    required_slide_keys = {
-        "slide_id",
-        "title",
-        "teaching_purpose",
-        "bridge_from_prior",
-        "onscreen_text",
-        "visual_plan",
-        "narrative_hook",
-        "analogy_or_example",
-        "narration",
-        "mini_recap",
-        "formula",
-        "estimated_seconds",
-        "cursor_hint",
-        "fact_check_notes",
-        "source_note",
-    }
-    for slide in slides:
-        missing = required_slide_keys.difference(slide.keys())
-        if missing:
-            raise ValueError(f"Storyboard slide is missing required keys: {sorted(missing)}")
-    return data
+
+
+def generate_course_outline(course_requirement: str, student_persona: str) -> dict:
+    data = generate_json_with_gemini(build_outline_prompt(course_requirement, student_persona))
+    return validate_outline_data(data)
+
+
+def generate_storyboard(outline: dict, course_requirement: str, student_persona: str) -> dict:
+    data = generate_json_with_gemini(build_storyboard_prompt(outline, course_requirement, student_persona))
+    return validate_storyboard_data(data)
+
+
+def generate_outline_and_storyboard(course_requirement: str, student_persona: str) -> tuple[dict, dict]:
+    prompt = f"""
+You are designing a complete text-to-video teaching lesson in one shot.
+
+Requirement:
+{course_requirement}
+
+Student persona:
+{student_persona}
+
+Return exactly one JSON object with these keys:
+- "outline": an outline object
+- "storyboard": a storyboard object
+
+The "outline" object must follow this schema:
+{build_outline_prompt(course_requirement, student_persona)}
+
+The "storyboard" object must follow this schema and must be consistent with the outline:
+{build_storyboard_prompt({"note": "Use the generated outline from this same response."}, course_requirement, student_persona)}
+
+Global rules:
+- The storyboard must be derived from the outline in the same response
+- English only
+- JSON only
+- No markdown fences
+- No explanations before or after the JSON
+"""
+    data = generate_json_with_gemini(prompt, required_keys=["outline", "storyboard"])
+    outline = validate_outline_data(data["outline"])
+    storyboard = validate_storyboard_data(data["storyboard"])
+    return outline, storyboard
 
 
 def build_manim_prompt(storyboard: dict, target_duration_seconds: int, repair_context: str | None = None) -> str:
@@ -233,6 +370,8 @@ Rules for the code:
 - Reflect the pedagogical structure in the storyboard: hook, scaffold, example, recap
 - Build visuals from shapes, text, arrows, tables, coordinate planes, braces, highlights, and LaTeX
 - Avoid external images, internet assets, or local file dependencies
+- Never use `ImageMobject`, `SVGMobject`, `TexturedSurface`, `Sphere`, `ThreeDScene`, or any filename like `assets/...`, `.png`, `.jpg`, `.jpeg`, `.svg`
+- Use only self-contained 2D primitives that exist in standard Manim Community
 - Keep text readable at 720p
 - Use separate visual beats for each slide/section
 - Make the visuals synchronize with the narration emphasis: when the narration introduces a contrast, comparison, misconception, or formula, the animation should highlight that exact element at the same moment
@@ -251,6 +390,9 @@ def generate_manim_lesson(storyboard: dict, target_duration_seconds: int, repair
         build_manim_prompt(storyboard, target_duration_seconds, repair_context=repair_context)
     )
     cleaned = code.replace("```python", "").replace("```", "").strip()
+    start_index = cleaned.find("from manim import *")
+    if start_index != -1:
+        cleaned = cleaned[start_index:].strip()
     if not cleaned.startswith("from manim import *"):
         raise ValueError("Generated Manim code did not start with `from manim import *`.")
     return {"manim_code": cleaned}
@@ -262,18 +404,57 @@ def sanitize_manim_code(manim_code: str) -> str:
     def replace_rate_func(match: re.Match) -> str:
         candidate = match.group(1)
         if candidate in allowed_rate_funcs:
-            return match.group(0)
+            return f"rate_func={candidate}"
         return "rate_func=smooth"
 
-    sanitized = re.sub(r"rate_func\s*=\s*([A-Za-z_][A-Za-z0-9_]*)", replace_rate_func, manim_code)
+    sanitized = re.sub(
+        r"rate_func\s*=\s*([A-Za-z_][A-Za-z0-9_]*)(?:\.[A-Za-z_][A-Za-z0-9_]*)*",
+        replace_rate_func,
+        manim_code,
+    )
+    sanitized = re.sub(r"rate_func\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s+t\s*:\s*[^,\)\n]+", r"rate_func=\1", sanitized)
+    sanitized = re.sub(r"rate_func\s*=\s*lambda\s+t\s*:\s*[^,\)\n]+", "rate_func=smooth", sanitized)
+    sanitized = re.sub(r"rate_func\s*=\s*[^,\)\n]*\bt\s*:\s*[^,\)\n]+", "rate_func=smooth", sanitized)
+    sanitized = re.sub(r"\)\s*\*\*\s*\d+", ")", sanitized)
     sanitized = sanitized.replace("rush_from", "smooth")
     sanitized = sanitized.replace("rush_into", "smooth")
+    sanitized = sanitized.replace("BROWN_D", "BROWN")
+    sanitized = sanitized.replace("align_direction=", "aligned_edge=")
     sanitized = sanitized.replace("VGroup(*self.mobjects)", "Group(*self.mobjects)")
     sanitized = sanitized.replace("FadeOut(VGroup(*self.mobjects))", "FadeOut(Group(*self.mobjects))")
+    sanitized = re.sub(
+        r"ImageMobject\([^\n]+\)",
+        'RoundedRectangle(width=1.8, height=1.2, corner_radius=0.15, color=BLUE_D, fill_opacity=0.15)',
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"SVGMobject\([^\n]+\)",
+        'RoundedRectangle(width=1.8, height=0.9, corner_radius=0.2, color=BLUE_D, fill_opacity=0.15)',
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"Speedometer\(\)",
+        "Circle(radius=0.35, color=GREEN, fill_opacity=0)",
+        sanitized,
+    )
+    sanitized = re.sub(r"[A-Za-z_][A-Za-z0-9_]*\.get_vector\(\)", "RIGHT", sanitized)
+    sanitized = sanitized.replace("Sphere(", "Circle(")
+    sanitized = sanitized.replace(".set_z(", ".set_z_index(")
+    sanitized = re.sub(
+        r"\.set_shading_config\(\{.*?\}\)",
+        "",
+        sanitized,
+        flags=re.DOTALL,
+    )
     return sanitized
 
 
-def render_manim_code(manim_code: str, output_path: str) -> str:
+def render_manim_code(
+    manim_code: str,
+    output_path: str,
+    timeout_seconds: int = 1200,
+    debug_output_dir: str | None = None,
+) -> str:
     if shutil.which("manim") is None:
         raise RuntimeError("The 'manim' command is not available in the current environment.")
 
@@ -282,8 +463,22 @@ def render_manim_code(manim_code: str, output_path: str) -> str:
     base_filename = output_path_obj.stem
     script_path = Path(f"temp_{base_filename}.py")
 
+    sanitized_code = sanitize_manim_code(manim_code)
     with script_path.open("w", encoding="utf-8") as file:
-        file.write(sanitize_manim_code(manim_code))
+        file.write(sanitized_code)
+
+    debug_dir_path = Path(debug_output_dir) if debug_output_dir else None
+    if debug_dir_path is not None:
+        debug_dir_path.mkdir(parents=True, exist_ok=True)
+        (debug_dir_path / "last_manim_code.py").write_text(sanitized_code, encoding="utf-8")
+
+    try:
+        compile(sanitized_code, str(script_path), "exec")
+    except SyntaxError as exc:
+        syntax_report = f"{exc.__class__.__name__}: {exc}\n"
+        if debug_dir_path is not None:
+            (debug_dir_path / "manim_render_error.txt").write_text(syntax_report, encoding="utf-8")
+        raise ManimRenderError("Sanitized Manim code is still invalid Python.", syntax_report) from exc
 
     command = [
         "manim",
@@ -298,11 +493,27 @@ def render_manim_code(manim_code: str, output_path: str) -> str:
 
     print(f"Starting Manim render for: {base_filename}")
     try:
-        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
     except subprocess.CalledProcessError as exc:
         render_log = "\n".join(part for part in [exc.stdout, exc.stderr] if part).strip()
         print(f"Manim rendering failed. Check the generated script: {script_path}")
+        if debug_dir_path is not None:
+            (debug_dir_path / "manim_render_error.txt").write_text(render_log, encoding="utf-8")
         raise ManimRenderError("Manim rendering failed.", render_log) from exc
+    except subprocess.TimeoutExpired as exc:
+        render_log = "\n".join(
+            part for part in [exc.stdout or "", exc.stderr or "", "Render timed out."] if part
+        ).strip()
+        print(f"Manim rendering timed out. Check the generated script: {script_path}")
+        if debug_dir_path is not None:
+            (debug_dir_path / "manim_render_error.txt").write_text(render_log, encoding="utf-8")
+        raise ManimRenderError("Manim rendering timed out.", render_log) from exc
     finally:
         if script_path.exists():
             script_path.unlink()

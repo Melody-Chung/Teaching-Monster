@@ -67,7 +67,9 @@ def generate_educational_video(payload: TeachingRequest, request: Request):
         return TeachingResponse(
             video_url=build_public_url(request, Path(result["final_video_path"])),
             subtitle_url=build_public_url(request, Path(result["subtitle_path"])),
-            supplementary_url=[],
+            supplementary_url=[
+                build_public_url(request, Path(path)) for path in result.get("supplementary_paths", [])
+            ],
         )
     except TimeoutError as exc:
         print(f"Pipeline timed out: {exc}")

@@ -2,6 +2,15 @@
 
 This project exposes a synchronous HTTP API for the Teaching Monster competition. The server waits until the video and subtitle files are fully generated before returning URLs, matching the competition requirement that downloads start immediately after the API response.
 
+The current rendering pipeline uses an HTML/CSS slide deck route instead of LLM-generated Manim code:
+
+- `outline + storyboard` generation with Gemini
+- slide deck export to `slides.md` and `slides.html`
+- deterministic slide image rendering with Pillow
+- slideshow video rendering with FFmpeg
+- narration generation with `edge-tts`
+- final MP4 merge plus VTT subtitles
+
 ## API
 
 - `POST /v1/video/generate`
@@ -42,7 +51,7 @@ This project exposes a synchronous HTTP API for the Teaching Monster competition
 - Subtitle plus supplementary size check: Enforced at runtime, maximum 100 MB combined.
 - Supplementary file count: Enforced at runtime, maximum 5 files.
 - Link retention: Request outputs are marked with `available_until_utc` and configured to remain available for at least 72 hours by default.
-- External media sources: This pipeline does not fetch third-party images, charts, or datasets. Visuals are generated from Manim primitives and LLM-authored scripts. As a result, no third-party asset attribution is required for the current implementation.
+- External media sources: This pipeline does not fetch third-party images, charts, or datasets. Visuals are generated from internal slide templates and LLM-authored text. As a result, no third-party asset attribution is required for the current implementation.
 - External services used:
   - Gemini API via `google-genai`
   - Microsoft Edge TTS via `edge-tts`
@@ -50,7 +59,8 @@ This project exposes a synchronous HTTP API for the Teaching Monster competition
 ## Environment Variables
 
 - `GEMINI_API_KEY`: Required.
-- `GEMINI_MODEL`: Optional, default `gemini-3-flash-preview`.
+- `GEMINI_MODEL`: Optional, default `gemini-2.5-flash`.
+- `GEMINI_FALLBACK_MODEL`: Optional, default `gemini-2.5-flash-lite`.
 - `MAX_REQUEST_RUNTIME_SECONDS`: Optional, default `1740` seconds (29 minutes).
 - `OUTPUT_RETENTION_HOURS`: Optional, default `72`.
 
